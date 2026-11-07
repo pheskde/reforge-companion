@@ -14,7 +14,7 @@ local LOCALES = {
     manualOff = "Turned off here", noAdvanced = "without Advanced Logging",
     started = "Combat log started (%s).", stopped = "Combat log stopped.",
     manualStarted = "Combat log started by hand. It keeps running until you stop it.",
-    failed = "The game did not start the combat log.", missingApi = "This game client offers no combat log function.",
+    failed = "The game did not start the combat log.", busy = "The game is limiting combat log calls right now. Try again in a few seconds.", missingApi = "This game client offers no combat log function.",
     tipClick = "Left click: start or stop the log", tipRight = "Right click: automatic on or off", tipDrag = "Drag: move",
     tipAuto = "Automatic: logs in dungeons and raids, stops %d minutes after leaving.",
     help = "/reforge start | stop | auto | lock | show | hide | reset",
@@ -27,7 +27,7 @@ local LOCALES = {
     manualOff = "Hier ausgeschaltet", noAdvanced = "ohne Advanced Logging",
     started = "Kampflog gestartet (%s).", stopped = "Kampflog gestoppt.",
     manualStarted = "Kampflog von Hand gestartet. Es läuft, bis du es stoppst.",
-    failed = "Das Spiel hat das Kampflog nicht gestartet.", missingApi = "Dieser Spielclient bietet keine Kampflog-Funktion.",
+    failed = "Das Spiel hat das Kampflog nicht gestartet.", busy = "Das Spiel begrenzt gerade Kampflog-Aufrufe. Versuche es in ein paar Sekunden noch einmal.", missingApi = "Dieser Spielclient bietet keine Kampflog-Funktion.",
     tipClick = "Linksklick: Log starten oder stoppen", tipRight = "Rechtsklick: Automatik an oder aus", tipDrag = "Ziehen: verschieben",
     tipAuto = "Automatik: loggt in Instanzen und Raids, stoppt %d Minuten nach dem Verlassen.",
     help = "/reforge start | stop | auto | lock | show | hide | reset",
@@ -39,8 +39,14 @@ ns.L = LOCALES[GetLocale()] or LOCALES.enUS
 local L = ns.L
 
 local db
-local wasLogging = false
+-- Letzter bekannter Zustand. Das Spiel begrenzt LoggingCombat auf 5 Aufrufe in 10 Sekunden, geteilt mit allen Addons und /combatlog,
+-- auch fuer reine Abfragen. Darum wird selten gefragt und sonst dieser Wert genutzt.
+local logging = false
+local nextQuery, nextAttempt = 0, 0
 local loggingSince, stopAt, suppressedFor, failedFor
+
+ns.QUERY_INTERVAL = 10
+ns.ATTEMPT_INTERVAL = 5
 
 function ns.Print(text)
   DEFAULT_CHAT_FRAME:AddMessage("|cfff27a2creforge:|r " .. text)
@@ -48,10 +54,6 @@ end
 
 local function apiAvailable()
   return type(LoggingCombat) == "function"
-end
-
-local function isLogging()
-  return LoggingCombat() and true or false
 end
 
 -- Instanztyp, wenn hier geloggt werden soll: nur Instanzen und Raids, nicht Arena, Schlachtfeld oder Szenario.
@@ -67,33 +69,49 @@ local function advancedOn()
   return GetCVar("advancedCombatLogging") == "1"
 end
 
+-- Schaltet das Log. Rueckgabe: true = wie gewuenscht, false = das Spiel weigert sich, nil = gerade im Limit, spaeter noch einmal.
+local function setLogging(wanted)
+  nextAttempt = GetTime() + ns.ATTEMPT_INTERVAL
+  local result = LoggingCombat(wanted)
+  if result == nil then
+    return nil
+  end
+  local running = result and true or false
+  if running == wanted then
+    logging = running
+    loggingSince = running and GetTime() or nil
+    nextQuery = GetTime() + ns.QUERY_INTERVAL
+    return true
+  end
+  return false
+end
+
 -- Die Auswertung braucht Advanced Logging; der Wert steht im Kopf der Logdatei und muss also vor dem Start gesetzt sein.
 local function start()
   if not advancedOn() then
     SetCVar("advancedCombatLogging", "1")
   end
-  LoggingCombat(true)
-  local running = isLogging()
-  if running then
-    wasLogging, loggingSince = true, GetTime()
-  end
-  return running
-end
-
-local function stop()
-  LoggingCombat(false)
-  wasLogging, loggingSince, stopAt = false, nil, nil
-  db.startedByAddon = false
+  return setLogging(true)
 end
 
 -- Bemerkt /combatlog und andere Addons: Wer das Log hier ausschaltet, dem schaltet es die Automatik nicht wieder an.
-local function noticeOutsideChange(logging, instanceId)
-  if logging == wasLogging then
+local function poll(instanceId)
+  local now = GetTime()
+  if now < nextQuery then
     return
   end
-  wasLogging = logging
-  if logging then
-    loggingSince = GetTime()
+  nextQuery = now + ns.QUERY_INTERVAL
+  local value = LoggingCombat()
+  if value == nil then
+    return -- Im Limit: Das heisst nicht, dass das Log aus ist.
+  end
+  local running = value and true or false
+  if running == logging then
+    return
+  end
+  logging = running
+  if running then
+    loggingSince = now
   else
     loggingSince, stopAt = nil, nil
     db.startedByAddon = false
@@ -106,32 +124,35 @@ function ns.Evaluate()
     return
   end
   local kind, instanceId = loggedInstance()
-  local logging = isLogging()
-  noticeOutsideChange(logging, instanceId)
+  poll(instanceId)
+  local now = GetTime()
 
   if kind then
     stopAt = nil
     if instanceId ~= suppressedFor then
       suppressedFor = nil
     end
-    if db.auto and not logging and suppressedFor == nil and failedFor ~= instanceId then
-      if start() then
+    if db.auto and not logging and suppressedFor == nil and failedFor ~= instanceId and now >= nextAttempt then
+      local result = start()
+      if result then
         db.startedByAddon = true
         failedFor = nil
         ns.Print(L.started:format(L[kind]))
-      else
+      elseif result == false then
         failedFor = instanceId
         ns.Print(L.failed)
       end
     end
   elseif logging and db.startedByAddon then
     -- Nur beenden, was der Companion selbst begonnen hat; ein von Hand gestartetes Log laeuft weiter.
-    local now = GetTime()
     if not stopAt then
       stopAt = now + ns.STOP_GRACE
-    elseif now >= stopAt then
-      stop()
-      ns.Print(L.stopped)
+    elseif now >= stopAt and now >= nextAttempt then
+      if setLogging(false) then
+        stopAt = nil
+        db.startedByAddon = false
+        ns.Print(L.stopped)
+      end
     end
   else
     stopAt = nil
@@ -145,7 +166,7 @@ function ns.Status()
   local kind, instanceId = loggedInstance()
   local now = GetTime()
   return {
-    state = isLogging() and "on" or "off",
+    state = logging and "on" or "off",
     auto = db and db.auto,
     kind = kind,
     advanced = advancedOn(),
@@ -160,16 +181,26 @@ function ns.Toggle()
     ns.Print(L.missingApi)
     return
   end
-  if isLogging() then
+  if logging then
     local _, instanceId = loggedInstance()
-    stop()
-    suppressedFor = instanceId
-    ns.Print(L.stopped)
-  elseif start() then
-    db.startedByAddon, suppressedFor, stopAt = false, nil, nil
-    ns.Print(L.manualStarted)
+    if setLogging(false) then
+      stopAt = nil
+      db.startedByAddon = false
+      suppressedFor = instanceId
+      ns.Print(L.stopped)
+    else
+      ns.Print(L.busy)
+    end
   else
-    ns.Print(L.failed)
+    local result = start()
+    if result then
+      db.startedByAddon, suppressedFor, stopAt = false, nil, nil
+      ns.Print(L.manualStarted)
+    elseif result == false then
+      ns.Print(L.failed)
+    else
+      ns.Print(L.busy)
+    end
   end
 end
 
@@ -202,11 +233,19 @@ events:SetScript("OnEvent", function(_, event, name)
     end
     -- Nach /reload laeuft das Log weiter und bleibt dem Companion zugeordnet, nach einem Neustart des Spiels nicht.
     if apiAvailable() then
-      wasLogging = isLogging()
-      loggingSince = wasLogging and GetTime() or nil
-      if not wasLogging then
-        db.startedByAddon = false
+      nextQuery = GetTime() + ns.QUERY_INTERVAL
+      local value = LoggingCombat()
+      if value == nil then
+        -- Im Limit ist die Antwort unbekannt: Die Zuordnung bleibt, und die naechste Abfrage bringt Klarheit.
+        logging = db.startedByAddon == true
+        nextQuery = GetTime()
+      else
+        logging = value and true or false
+        if not logging then
+          db.startedByAddon = false
+        end
       end
+      loggingSince = logging and GetTime() or nil
     end
     events:UnregisterEvent("ADDON_LOADED")
     ns.CreateWindow()

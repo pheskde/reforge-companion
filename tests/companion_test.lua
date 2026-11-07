@@ -11,6 +11,11 @@ local function check(name, condition)
   end
 end
 
+-- Wie /combatlog: aendert den Zustand, ohne dass der Companion davon erfaehrt.
+local function typeCommand(game, value)
+  game.logging = value
+end
+
 -- Baut die Spielumgebung neu auf und laedt das Addon; `saved` sind die SavedVariables aus der letzten Sitzung.
 local function newGame(opts)
   opts = opts or {}
@@ -65,7 +70,20 @@ local function newGame(opts)
   GetInstanceInfo = function() return "Name", game.kind, 0, "", 5, 0, false, game.instanceId end
   GetCVar = function() return game.advanced end
   SetCVar = function(_, value) game.advanced = value end
+  -- Wie im Spiel: 5 Aufrufe in 10 Sekunden, auch reine Abfragen; im Limit geschieht nichts und die Antwort ist nil.
+  game.calls, game.peak, game.limited, game.saturated = {}, 0, 0, false
   LoggingCombat = function(value)
+    local recent = {}
+    for _, at in ipairs(game.calls) do
+      if game.now - at < 10 then recent[#recent + 1] = at end
+    end
+    game.calls = recent
+    if game.saturated or #recent >= 5 then
+      game.limited = game.limited + 1
+      return nil
+    end
+    recent[#recent + 1] = game.now
+    if #recent > game.peak then game.peak = #recent end
     if value == true and not game.refuseStart then
       if not game.logging then game.starts = game.starts + 1 end
       game.logging = true
@@ -116,8 +134,10 @@ do
   check("draussen kein Log", not game.logging)
   game.enter("raid")
   check("Raid startet das Log", game.logging)
-  game.leave(); game.enter("party", 101)
-  check("Instanz startet das Log", game.logging)
+  local dungeon = newGame()
+  dungeon.login()
+  dungeon.enter("party", 101)
+  check("Instanz startet das Log", dungeon.logging)
   for _, kind in ipairs({ "arena", "pvp", "scenario" }) do
     local other = newGame()
     other.login()
@@ -141,7 +161,7 @@ do
   game.pass(299)
   check("Rueckkehr setzt die Frist zurueck", game.logging)
   check("Corpse-Run erzeugt keine neue Datei", game.starts == 1)
-  game.pass(1)
+  game.pass(6)
   check("nach der Frist stoppt es", not game.logging)
 end
 
@@ -153,15 +173,15 @@ do
   check("von Hand gestartet", game.logging)
   game.enter("raid")
   game.leave()
-  game.pass(1); game.pass(3600)
+  game.pass(11); game.pass(3600)
   check("von Hand gestartetes Log laeuft weiter", game.logging)
 
   local typed = newGame()
   typed.login()
-  LoggingCombat(true) -- wie /combatlog
-  typed.pass(1)
+  typeCommand(typed, true)
+  typed.pass(11)
   typed.enter("raid"); typed.leave()
-  typed.pass(1); typed.pass(3600)
+  typed.pass(11); typed.pass(3600)
   check("per /combatlog gestartetes Log laeuft weiter", typed.logging)
 end
 
@@ -171,19 +191,19 @@ do
   game.login()
   game.enter("raid", 7)
   game.ns.Toggle()
-  game.pass(5)
+  game.pass(11)
   check("Ausschalten per Klick bleibt", not game.logging)
   check("Status zeigt die Sperre", game.ns.Status().suppressed)
-  game.leave(); game.pass(1); game.enter("raid", 7)
+  game.leave(); game.pass(11); game.enter("raid", 7)
   check("gilt auch nach dem Corpse-Run", not game.logging)
-  game.leave(); game.enter("raid", 8)
+  game.leave(); game.pass(6); game.enter("raid", 8)
   check("die naechste Instanz loggt wieder", game.logging)
 
   local typed = newGame()
   typed.login()
   typed.enter("raid", 7)
-  LoggingCombat(false) -- wie /combatlog
-  typed.pass(1); typed.pass(5)
+  typeCommand(typed, false)
+  typed.pass(11); typed.pass(11)
   check("Ausschalten per /combatlog bleibt", not typed.logging)
 end
 
@@ -206,8 +226,8 @@ do
   check("Start setzt Advanced Logging", game.advanced == "1")
   local typed = newGame({ advanced = "0" })
   typed.login()
-  LoggingCombat(true)
-  typed.pass(1)
+  typeCommand(typed, true)
+  typed.pass(11)
   check("Status meldet fehlendes Advanced Logging", typed.ns.Status().advanced == false)
 end
 
@@ -215,14 +235,14 @@ end
 do
   local game = newGame({ logging = true, saved = { startedByAddon = true } })
   game.login()
-  game.pass(1); game.pass(300)
+  game.pass(11); game.pass(300); game.pass(6)
   check("nach /reload beendet es sein eigenes Log", not game.logging)
   local fresh = newGame({ saved = { startedByAddon = true } })
   fresh.login()
   check("neuer Spielstart vergisst die Zuordnung", ReforgeCompanionDB.startedByAddon == false)
   local keep = newGame({ logging = true })
   keep.login()
-  keep.pass(1); keep.pass(600)
+  keep.pass(11); keep.pass(600)
   check("beim Laden laufendes fremdes Log bleibt", keep.logging)
 end
 
@@ -232,7 +252,7 @@ do
   game.login()
   game.enter("raid")
   local count = #game.messages
-  game.pass(1); game.pass(1); game.pass(1)
+  game.pass(6); game.pass(6); game.pass(6)
   check("Fehlschlag meldet sich einmal", #game.messages == count and count == 1)
 end
 
@@ -252,7 +272,7 @@ do
   game.login()
   local slash = SlashCmdList.REFORGECOMPANION
   slash("start"); check("/reforge start", game.logging)
-  slash("start"); check("/reforge start ist kein Umschalter", game.logging)
+  slash("start"); check("/reforge start ist kein Umschalter", game.logging and game.starts == 1)
   slash("stop"); check("/reforge stop", not game.logging)
   slash("auto"); check("/reforge auto", ReforgeCompanionDB.auto == false)
   slash("lock"); check("/reforge lock", ReforgeCompanionDB.locked == true)
@@ -264,6 +284,95 @@ do
   check("Linksklick startet", game.logging)
   game.window().scripts.OnClick(game.window(), "RightButton")
   check("Rechtsklick schaltet die Automatik", ReforgeCompanionDB.auto == true)
+end
+
+-- Das Limit des Spiels: Der Companion bleibt deutlich darunter, damit andere Addons und /combatlog weiter funktionieren.
+do
+  local game = newGame()
+  game.login()
+  game.enter("raid")
+  for _ = 1, 120 do game.pass(1) end
+  check("hoechstens eine Abfrage je 10 Sekunden", #game.calls <= 2)
+  check("im Betrieb nie im Limit", game.limited == 0 and game.peak <= 3)
+end
+
+-- Viele Zonenwechsel auf einmal kosten keine Aufrufe.
+do
+  local game = newGame()
+  game.login()
+  game.enter("raid")
+  local before = #game.calls
+  for _ = 1, 50 do game.fire("ZONE_CHANGED_NEW_AREA") end
+  check("Ereignisse rufen die API nicht je Mal", #game.calls == before and game.limited == 0)
+end
+
+-- Im Limit heisst nil nicht "aus": keine Sperre, und das Log laeuft danach normal weiter.
+do
+  local game = newGame()
+  game.login()
+  game.enter("raid", 5)
+  check("gestartet", game.logging)
+  game.saturated = true
+  for _ = 1, 30 do game.pass(1) end
+  check("Limit zeigt das Log nicht als aus", game.ns.Status().state == "on")
+  check("Limit setzt keine Sperre", not game.ns.Status().suppressed)
+  check("Log laeuft wirklich weiter", game.logging and game.starts == 1)
+  game.saturated = false
+  game.leave()
+  game.pass(1); game.pass(300); game.pass(6)
+  check("eigenes Log wird danach trotzdem beendet", not game.logging)
+end
+
+-- Start im Limit: kein Fehler, sondern ein neuer Versuch.
+do
+  local game = newGame()
+  game.login()
+  game.saturated = true
+  local before = #game.messages
+  game.enter("raid", 5)
+  check("im Limit noch nicht gestartet", not game.logging)
+  check("im Limit keine Fehlermeldung", #game.messages == before)
+  game.pass(2)
+  game.saturated = false
+  game.pass(6)
+  check("Start wird nachgeholt", game.logging and game.starts == 1)
+end
+
+-- Stoppen im Limit wird nachgeholt.
+do
+  local game = newGame()
+  game.login()
+  game.enter("raid", 5)
+  game.leave()
+  game.pass(1)
+  game.saturated = true
+  game.pass(305)
+  check("im Limit laeuft es noch", game.logging)
+  game.saturated = false
+  game.pass(6)
+  check("Stopp wird nachgeholt", not game.logging)
+end
+
+-- Klick im Limit: Hinweis statt falschem Zustand.
+do
+  local game = newGame()
+  game.login()
+  game.saturated = true
+  local before = #game.messages
+  game.ns.Toggle()
+  check("Klick im Limit aendert nichts", not game.logging and game.ns.Status().state == "off")
+  check("Klick im Limit gibt einen Hinweis", #game.messages == before + 1 and game.messages[#game.messages]:find("begrenzt") ~= nil)
+end
+
+-- Laden im Limit: Die Zuordnung eines eigenen Logs bleibt, die naechste Abfrage klaert den Stand.
+do
+  local game = newGame({ logging = true, saved = { startedByAddon = true } })
+  game.saturated = true
+  game.login()
+  check("Zuordnung bleibt, solange die Antwort unbekannt ist", ReforgeCompanionDB.startedByAddon == true)
+  game.saturated = false
+  game.pass(1); game.pass(301); game.pass(6)
+  check("Eigenes Log wird danach beendet", not game.logging)
 end
 
 -- Beide Sprachen enthalten dieselben Texte.
