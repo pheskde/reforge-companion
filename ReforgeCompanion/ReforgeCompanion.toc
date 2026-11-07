@@ -1,0 +1,11 @@
+## Interface: 16001
+## Title: |cfff27a2creforge|r Companion
+## Notes: Shows the combat log status and turns logging on in dungeons and raids.
+## Notes-deDE: Zeigt den Status des Kampflogs und schaltet es in Instanzen und Raids automatisch ein.
+## Author: reforge.win
+## Version: 1.0.0
+## SavedVariables: ReforgeCompanionDB
+## AddonCompartmentFunc: ReforgeCompanion_OnAddonCompartmentClick
+
+Core.lua
+UI.lua
