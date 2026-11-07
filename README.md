@@ -26,5 +26,5 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint lua nickblah/lua:5.1 tests/compa
 ## Veröffentlichen
 
 1. `## Version` in `ReforgeCompanion/ReforgeCompanion.toc` hochzählen. Nach einem Spiel-Patch auch `## Interface`.
-2. Tag setzen, zum Beispiel `v1.0.1`.
-3. In `reforge.win` den Tag in `library/catalog.json` eintragen. Mit dem nächsten Deployment bieten die Clients das Update an.
+2. Committen, pushen und den Tag setzen und pushen (`git tag v1.0.2 && git push origin v1.0.2`). Der Tag muss zur Version passen (`v` plus `## Version`), sonst bricht der Workflow ab; er legt das GitHub-Release an.
+3. Fertig: Das Backend holt das neueste Release spätestens nach 15 Minuten selbst (`"ref": "latest"` im Katalog von `reforge.win`), die Clients bieten das Update in der Bibliothek an.
